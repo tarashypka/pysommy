@@ -4,6 +4,9 @@ import numpy as np
 from tqdm import tqdm
 
 
+NA = np.newaxis
+
+
 class BatchGenerator:
     def __init__(self, data: np.array, batch_size: int, shuffle: False):
         self.data = data
@@ -38,15 +41,17 @@ class BatchGenerator:
 
 
 class Som:
-    def __init__(self, width: int, height: int, depth: int):
+    def __init__(self, width: int, height: int, depth: int, dist: str= 'cosine'):
         self.width = width
         self.height = height
         self.depth = depth
+        self.dist = dist
 
-        self.grid_: np.array = None  # Shape is (width, height, 2)
-        self.grid_norms_: np.array = None  # Shape is (width, height)
-        self.weights_: np.array = None  # Shape is (width, height, depth)
-        self.weights_norms_: np.array = None  # Shape is (width, height)
+        self.grid_: np.array = None  # shape=(width, height, 2)
+        self.grid_norms_: np.array = None  # shape=(width, height)
+        self.weights_: np.array = None  # shape=(width, height, depth)
+        self.weights_norms_: np.array = None  # shape=(width, height)
+        self.greater_is_closer_: bool = None
 
         self.initialize()
 
@@ -55,32 +60,52 @@ class Som:
         self.grid_norms_ = (self.grid_ * self.grid_).sum(axis=2) ** 0.5
         # Initialize with small random values
         self.weights_ = np.random.uniform(low=-.1, high=+.1, size=(self.width, self.height, self.depth))
-        self.weights_norms_ = (self.weights_ * self.weights_).sum(axis=2) ** 0.5
-        #self.weights_ /= self.weights_norms_[:, :, np.newaxis]
+        if self.dist in ['cosine']:
+            self.weights_norms_ = (self.weights_ * self.weights_).sum(axis=2) ** 0.5
+        if self.dist in ['cosine']:
+            self.greater_is_closer_ = True
+        elif self.dist in ['euclidean']:
+            self.greater_is_closer_ = False
+        else:
+            raise ValueError(f"Unrecognized similarity={self.dist}")
 
-    def similarity(self, inp: np.array):
+    def similarity(self, inp: np.array) -> np.array:
         assert inp.ndim == 2
-        w, w_norm = self.weights_, self.weights_norms_
-        i, i_norm = inp, (inp * inp).sum(axis=1) ** 0.5
-        # Similarity of each cell weights with the inputs. Shape is (batch_size, height, width)
-        s = np.dot(w, i.T) / w_norm[:, :, np.newaxis] / i_norm[np.newaxis, np.newaxis, :]
-        return np.rollaxis(s, axis=2)
+        w, i = self.weights_, inp
+        # Similarity of each cell weights with the inputs
+        if self.dist == 'cosine':
+            w_norm, i_norm = self.weights_norms_, (inp * inp).sum(axis=1) ** 0.5
+            s = np.dot(w, i.T) / w_norm[:, :, NA] / i_norm[NA, NA, :]
+            s = np.rollaxis(s, axis=2)
+        elif self.dist == 'euclidean':
+            s = ((i[:, NA, NA, :] - w[NA, :, :, :]) ** 2).sum(axis=3) ** 0.5
+        return s  # shape=(batch_size, width, height)
 
     def closest(self, inp: np.array=None, inp_sim: np.array=None) -> np.array:
         if inp is not None: assert inp.ndim == 2
         if inp_sim is not None: assert inp_sim.ndim == 3
         s = self.similarity(inp=inp) if inp_sim is None else inp_sim
-        # Most similar cells for each of the input. Shape is (batch_size, 2)
-        return np.asarray(list(zip(*np.unravel_index(s.reshape(s.shape[0], -1).argmax(axis=1), s.shape[1:]))))
+        # Most similar cells for each of the input
+        argclose = np.argmax if self.greater_is_closer_ else np.argmin  # shape=(batch_size, 2)
+        return np.asarray(list(zip(*np.unravel_index(argclose(s.reshape(s.shape[0], -1), axis=1), s.shape[1:]))))
 
-    def adjust_weights(self, inp: np.array, lr: float, spread_func: Callable):
+    def update(self, inp: np.array, lr: float, spread_func: Callable):
         assert inp.ndim == 2
         batch_size = inp.shape[0]
-        sim = self.similarity(inp=inp)  # Shape is (batch_size, height, weight)
-        winners = self.closest(inp_sim=sim)  # Shape is (batch_size, 2)
-        self.weights_ += lr * np.dot(np.rollaxis(spread_func(winners) * sim, axis=0, start=3), inp) / batch_size
-        self.weights_norms_ = (self.weights_ * self.weights_).sum(axis=2) ** 0.5
-        #self.weights_ /= self.weights_norms_[:, :, np.newaxis]
+        if self.dist == 'cosine':
+            sim = self.similarity(inp=inp)  # shape=(batch_size, width, height)
+            winners = self.closest(inp_sim=sim)  # shape=(batch_size, 2)
+            spread = spread_func(winners)  # shape=(batch_size, width, height)
+            dw = np.dot(np.rollaxis(spread * sim, axis=0, start=3), inp)  # shape=(width, height, depth)
+        elif self.dist == 'euclidean':
+            dw = inp[:, NA, NA, :] - self.weights_[NA, :, :, :]  # shape=(batch_size, width, height, depth)
+            sim = (dw ** 2).sum(axis=3) ** 0.5  # shape=(batch_size, width, height)
+            winners = self.closest(inp_sim=sim)  # shape=(batch_size, 2)
+            spread = spread_func(winners)  # shape=(batch_size, width, height)
+            dw = (spread[:, :, :, NA] * dw).sum(axis=0)  # shape=(width, height, depth)
+        self.weights_ += lr * dw / batch_size
+        if self.dist in ['cosine']:
+            self.weights_norms_ = (self.weights_ * self.weights_).sum(axis=2) ** 0.5
 
 
 class Neighbourhood:
@@ -108,11 +133,11 @@ class GaussianNeighbourhood(Neighbourhood):
         assert centers.ndim == 2
         m, m2 = self.som.grid_, self.som.grid_norms_ ** 2
         c, c2 = centers, (centers * centers).sum(axis=1)
-        # Distance from each cell to the centers. Shape is (batch_size, height, width)
-        d2 = m2[:, :, np.newaxis] - 2 * np.dot(m, c.T) + c2[np.newaxis, np.newaxis, :]
+        # Distance from each cell to the centers
+        d2 = m2[:, :, NA] - 2 * np.dot(m, c.T) + c2[NA, NA, :]  # shape=(batch_size, height, width)
         d2 = np.rollaxis(d2, axis=2)
         s2 = self.sigma_ ** 2
-        return np.exp(- d2 / (2 * s2)) #/ (2 * np.pi * s2) ** 0.5
+        return np.exp(- d2 / (2 * s2))
 
     def next_iter(self):
         self.iter_ += 1
@@ -138,5 +163,5 @@ class SomTrainer:
         progress_bar = tqdm if progress_bar is None else progress_bar
         for _ in progress_bar(range(epochs)):
             for batch in batch_gen:
-                self.som.adjust_weights(inp=batch, lr=self.lr_, spread_func=self.neighbourhood)
+                self.som.update(inp=batch, lr=self.lr_, spread_func=self.neighbourhood)
                 self.next_iter()
