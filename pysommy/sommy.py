@@ -38,34 +38,33 @@ class BatchGenerator:
 
 
 class Som:
-    def __init__(self, height: int, width: int, depth: int):
-        self.height = height
+    def __init__(self, width: int, height: int, depth: int):
         self.width = width
+        self.height = height
         self.depth = depth
 
-        self.grid_: np.array = None  # Shape is (height, width, 2)
-        self.grid_norms_: np.array = None  # Shape is (height, width)
-        self.weights_: np.array = None  # Shape is (height, width, depth)
-        self.weights_norms_: np.array = None  # Shape is (height, width)
+        self.grid_: np.array = None  # Shape is (width, height, 2)
+        self.grid_norms_: np.array = None  # Shape is (width, height)
+        self.weights_: np.array = None  # Shape is (width, height, depth)
+        self.weights_norms_: np.array = None  # Shape is (width, height)
 
         self.initialize()
 
     def initialize(self):
-        self.grid_ = np.asarray([[[i, j] for j in range(self.width)] for i in range(self.height)])
+        self.grid_ = np.asarray([[[i, j] for j in range(self.height)] for i in range(self.width)])
         self.grid_norms_ = (self.grid_ * self.grid_).sum(axis=2) ** 0.5
         # Initialize with small random values
-        self.weights_ = np.random.uniform(low=-.1, high=+.1, size=(self.height, self.width, self.depth))
+        self.weights_ = np.random.uniform(low=-.1, high=+.1, size=(self.width, self.height, self.depth))
         self.weights_norms_ = (self.weights_ * self.weights_).sum(axis=2) ** 0.5
         #self.weights_ /= self.weights_norms_[:, :, np.newaxis]
 
     def similarity(self, inp: np.array):
         assert inp.ndim == 2
-        batch_size = inp.shape[0]
         w, w_norm = self.weights_, self.weights_norms_
         i, i_norm = inp, (inp * inp).sum(axis=1) ** 0.5
         # Similarity of each cell weights with the inputs. Shape is (batch_size, height, width)
         s = np.dot(w, i.T) / w_norm[:, :, np.newaxis] / i_norm[np.newaxis, np.newaxis, :]
-        return s.reshape(batch_size, self.height, self.width)
+        return np.rollaxis(s, axis=2)
 
     def closest(self, inp: np.array=None, inp_sim: np.array=None) -> np.array:
         if inp is not None: assert inp.ndim == 2
@@ -79,7 +78,7 @@ class Som:
         batch_size = inp.shape[0]
         sim = self.similarity(inp=inp)  # Shape is (batch_size, height, weight)
         winners = self.closest(inp_sim=sim)  # Shape is (batch_size, 2)
-        self.weights_ += lr * np.dot((spread_func(winners) * sim).T, inp) / batch_size
+        self.weights_ += lr * np.dot(np.rollaxis(spread_func(winners) * sim, axis=0, start=3), inp) / batch_size
         self.weights_norms_ = (self.weights_ * self.weights_).sum(axis=2) ** 0.5
         #self.weights_ /= self.weights_norms_[:, :, np.newaxis]
 
@@ -107,12 +106,11 @@ class GaussianNeighbourhood(Neighbourhood):
 
     def __call__(self, centers: np.array) -> np.array:
         assert centers.ndim == 2
-        batch_size = centers.shape[0]
         m, m2 = self.som.grid_, self.som.grid_norms_ ** 2
         c, c2 = centers, (centers * centers).sum(axis=1)
         # Distance from each cell to the centers. Shape is (batch_size, height, width)
         d2 = m2[:, :, np.newaxis] - 2 * np.dot(m, c.T) + c2[np.newaxis, np.newaxis, :]
-        d2 = d2.reshape(batch_size, self.som.height, self.som.width)
+        d2 = np.rollaxis(d2, axis=2)
         s2 = self.sigma_ ** 2
         return np.exp(- d2 / (2 * s2)) #/ (2 * np.pi * s2) ** 0.5
 
