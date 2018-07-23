@@ -1,7 +1,10 @@
+import os
 from typing import *
 
 import numpy as np
 from tqdm import tqdm
+
+from pysimple.io import dump_pickle, load_pickle
 
 
 NA = np.newaxis
@@ -59,6 +62,7 @@ class Som:
         self.grid_ = np.asarray([[[i, j] for j in range(self.height)] for i in range(self.width)])
         self.grid_norms_ = (self.grid_ * self.grid_).sum(axis=2) ** 0.5
         # Initialize with small random values
+        np.random.seed()
         self.weights_ = np.random.uniform(low=-.1, high=+.1, size=(self.width, self.height, self.depth))
         if self.dist in ['cosine']:
             self.weights_norms_ = (self.weights_ * self.weights_).sum(axis=2) ** 0.5
@@ -122,12 +126,10 @@ class Neighbourhood:
 
 class GaussianNeighbourhood(Neighbourhood):
 
-    def __init__(self, som: Som, sigma_decay: Callable=None):
+    def __init__(self, som: Som):
         self.som = som
-        self.sigma_decay = sigma_decay
 
-        self.iter_: int = 0
-        self.sigma_: float = self.sigma_decay(0)
+        self.sigma_: float = None
 
     def __call__(self, centers: np.array) -> np.array:
         assert centers.ndim == 2
@@ -139,29 +141,64 @@ class GaussianNeighbourhood(Neighbourhood):
         s2 = self.sigma_ ** 2
         return np.exp(- d2 / (2 * s2))
 
-    def next_iter(self):
-        self.iter_ += 1
-        self.sigma_ = self.sigma_decay(self.iter_)
+
+class SomCallback:
+
+    def __init__(self, trainer=None, call_at: List[int]=None):
+        self.trainer = trainer
+        self.call_at = call_at
+
+    def init(self):
+        pass
+
+    def call(self):
+        pass
+
+    def __call__(self, *args, **kwargs):
+        if self.trainer.iter_ in self.call_at:
+            self.call()
 
 
 class SomTrainer:
 
-    def __init__(self, som: Som, neighbourhood: Neighbourhood, lr_decay: Callable):
+    def __init__(self, som: Som, neighbourhood: Neighbourhood):
         self.som = som
         self.neighbourhood = neighbourhood
-        self.lr_decay = lr_decay
 
+        self.epoch_: int = 0
         self.iter_: int = 0
-        self.lr_: float = self.lr_decay(0)
+        self.lr_: float = None
+        self.history_: Dict = None
+        self.progress_bar_: tqdm = None
 
-    def next_iter(self):
-        self.iter_ += 1
-        self.lr_ = self.lr_decay(self.iter_)
-        self.neighbourhood.next_iter()
+    def memorize(self, **kwargs):
+        self.history_ = dict() if self.history_ is None else self.history_
+        for name, val in kwargs.items():
+            self.history_[name] = self.history_.get(name, []) + [val]
 
-    def fit(self, batch_gen: Generator, epochs: int, progress_bar=None):
+    def fit(self, batch_gen: Generator, epochs: int, progress_bar=None, callbacks: List[SomCallback]=None):
+        callbacks = [] if callbacks is None else callbacks
+        for callback in callbacks:
+            callback.init()
         progress_bar = tqdm if progress_bar is None else progress_bar
-        for _ in progress_bar(range(epochs)):
-            for batch in batch_gen:
+        self.progress_bar_ = progress_bar(range(1, epochs + 1))
+        for _ in self.progress_bar_:
+            for i, batch in enumerate(batch_gen):
                 self.som.update(inp=batch, lr=self.lr_, spread_func=self.neighbourhood)
-                self.next_iter()
+                for callback in callbacks:
+                    callback()
+                self.iter_ += 1
+            self.epoch_ += 1
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        # Ignore unpickable fields
+        del state['progress_bar_']
+        return state
+
+    def save(self, filepath: os.PathLike, **kwargs):
+        dump_pickle(filepath=filepath, obj=self, **kwargs)
+
+    @staticmethod
+    def load(filepath: os.PathLike, **kwargs):
+        return load_pickle(filepath=filepath, **kwargs)
